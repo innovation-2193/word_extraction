@@ -2,7 +2,6 @@ import streamlit as st
 import zipfile
 import xml.etree.ElementTree as ET
 import re
-import io
 
 # Namespace ของ Microsoft Word XML
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -139,12 +138,37 @@ def process_docx(file_buffer):
         styles_data = parse_styles(docx_zip)
         list_counters = {}
         
+        # ฟังก์ชันสกัดข้อความปกติ
         def extract_raw_from_xml(filename):
             if filename not in docx_zip.namelist(): return ""
             xml_content = docx_zip.read(filename)
             root = ET.fromstring(xml_content)
             
             text_result = ""
+            for p in root.findall(f".//{w_tag('p')}"):
+                p_text = ""
+                for elem in p.iter():
+                    if elem.tag == w_tag('t') and elem.text:
+                        p_text += elem.text
+                    elif elem.tag == w_tag('tab'):
+                        p_text += "\t"
+                    elif elem.tag in[w_tag('br'), w_tag('cr')]:
+                        if elem.attrib.get(w_tag('type')) != 'page':
+                            p_text += "\n"
+                    elif elem.tag == w_tag('sym'):
+                        p_text += "•"
+                text_result += p_text + "\n"
+            return text_result
+
+        # ฟังก์ชันสกัดข้อความแบบ "แบ่งหน้ากระดาษ (Page by Page)"
+        def extract_pages_from_xml(filename):
+            if filename not in docx_zip.namelist(): return[]
+            xml_content = docx_zip.read(filename)
+            root = ET.fromstring(xml_content)
+            
+            pages =[]
+            current_page_text = ""
+            
             for p in root.findall(f".//{w_tag('p')}"):
                 p_text = ""
                 numPr = p.find(f".//{w_tag('numPr')}")
@@ -168,20 +192,30 @@ def process_docx(file_buffer):
                     p_text += get_list_string(list_num_id, list_ilvl, numbering_data, list_counters)
                     
                 for elem in p.iter():
-                    if elem.tag == w_tag('t') and elem.text:
+                    # ตรวจจับการขึ้นหน้าใหม่ (Page Break)
+                    if elem.tag == w_tag('lastRenderedPageBreak') or (elem.tag == w_tag('br') and elem.attrib.get(w_tag('type')) == 'page'):
+                        if current_page_text.strip() or p_text.strip():
+                            pages.append(current_page_text + p_text)
+                        current_page_text = ""
+                        p_text = ""
+                    elif elem.tag == w_tag('t') and elem.text:
                         p_text += elem.text
                     elif elem.tag == w_tag('tab'):
                         p_text += "\t"
-                    elif elem.tag in [w_tag('br'), w_tag('cr')]:
-                        p_text += "\n"
+                    elif elem.tag in[w_tag('br'), w_tag('cr')]:
+                        if elem.attrib.get(w_tag('type')) != 'page':
+                            p_text += "\n"
                     elif elem.tag == w_tag('sym'):
                         p_text += "•"
                         
-                text_result += p_text + "\n"
-            return text_result
+                current_page_text += p_text + "\n"
+                
+            if current_page_text.strip():
+                pages.append(current_page_text)
+            return pages
 
-        # 1. ส่วนหัว
-        header_text = ""
+        # 1. ดึงข้อความ Header ชุดตั้งต้น (Master Header)
+        master_header = ""
         seen_headers = set()
         header_files = sorted([f for f in docx_zip.namelist() if re.match(r"^word/header\d+\.xml$", f)])
         for h in header_files:
@@ -189,16 +223,10 @@ def process_docx(file_buffer):
             trimmed = extracted.strip()
             if trimmed and trimmed not in seen_headers:
                 seen_headers.add(trimmed)
-                header_text += extracted + "\n"
+                master_header += extracted + "\n"
                 
-        # 2. เนื้อหาหลัก
-        main_text = ""
-        main_text += extract_raw_from_xml("word/document.xml")
-        main_text += extract_raw_from_xml("word/footnotes.xml")
-        main_text += extract_raw_from_xml("word/endnotes.xml")
-        
-        # 3. ส่วนท้าย
-        footer_text = ""
+        # 2. ดึงข้อความ Footer ชุดตั้งต้น (Master Footer)
+        master_footer = ""
         seen_footers = set()
         footer_files = sorted([f for f in docx_zip.namelist() if re.match(r"^word/footer\d+\.xml$", f)])
         for f in footer_files:
@@ -206,26 +234,62 @@ def process_docx(file_buffer):
             trimmed = extracted.strip()
             if trimmed and trimmed not in seen_headers and trimmed not in seen_footers:
                 seen_footers.add(trimmed)
-                footer_text += extracted + "\n"
-                
-        # ประกอบร่าง
+                master_footer += extracted + "\n"
+
+        # 3. สกัดเนื้อหาหลักออกเป็นรายหน้า (Pages)
+        pages = extract_pages_from_xml("word/document.xml")
+        
+        # เพิ่มเชิงอรรถ/อ้างอิง ไว้ที่ท้ายสุดของเอกสาร
+        notes_text = extract_raw_from_xml("word/footnotes.xml") + extract_raw_from_xml("word/endnotes.xml")
+        if notes_text.strip() and pages:
+            pages[-1] += "\n\n--- [เชิงอรรถ/อ้างอิง] ---\n" + notes_text.strip()
+
+        # ===============================================
+        # ฟังก์ชันปรับเปลี่ยนตัวเลขหน้าใน Header อัตโนมัติ (AI Logic)
+        # ===============================================
+        def update_header_page_num(header_text, page_num):
+            def repl(match):
+                prefix = match.group(1)
+                num_str = match.group(2)
+                # เช็คว่าเป็นเลขไทยหรือไม่ ถ้าใช่ให้รันเลขไทย ถ้าไม่ให้รันเลขอาราบิก
+                if any(c in '๐๑๒๓๔๕๖๗๘๙' for c in num_str):
+                    new_num = ''.join(['๐','๑','๒','๓','๔','๕','๖','๗','๘','๙'][int(d)] for d in str(page_num))
+                else:
+                    new_num = str(page_num)
+                return f"{prefix} {new_num}"
+            
+            # วิ่งหาคำว่า "หน้า 1", "หน้าที่ ๑", "Page 2" ในข้อความ
+            return re.sub(r"(page|หน้า|หน้าที่)\s*([๐-๙0-9]+)", repl, header_text, flags=re.IGNORECASE)
+
+        # 4. ประกอบร่างข้อความ (Assemble)
         final_output = ""
-        if header_text.strip():
-            final_output += "---[ส่วนหัว] ---\n" + header_text.strip() + "\n\n\n"
-        if main_text.strip():
-            final_output += "---[เนื้อหาหลัก] ---\n" + main_text.strip() + "\n\n\n"
-        if footer_text.strip():
-            final_output += "---[ส่วนท้าย] ---\n" + footer_text.strip() + "\n"
+        if not pages:
+            pages = [""] # กันเหนียวกรณีไฟล์เปล่า
+            
+        for i, page_text in enumerate(pages, start=1):
+            # เสก Header ใหม่ตามหมายเลขหน้า
+            page_header = update_header_page_num(master_header, i)
+            
+            if page_header.strip():
+                final_output += f"--- [ส่วนหัว หน้าที่ {i}] ---\n{page_header.strip()}\n\n"
+                
+            final_output += f"---[เนื้อหาหลัก หน้าที่ {i}] ---\n{page_text.strip()}\n\n\n"
+            
+        # แปะ Footer ไว้ท้ายสุดของไฟล์เพียงชุดเดียว
+        if master_footer.strip():
+            final_output += f"--- [ส่วนท้าย] ---\n{master_footer.strip()}\n"
             
         return final_output.strip()
 
 # ================= UI STREAMLIT =================
 st.set_page_config(page_title="Word Text Extractor", page_icon="📄", layout="wide")
 
-st.title("📄 เครื่องมือดึงข้อความดิบจาก Word")
+st.title("📄 เครื่องมือดึงข้อความดิบจาก Word (แยกหน้ากระดาษ)")
 st.markdown("""
-รองรับ **.docx** ดึงทุกตัวอักษร รักษาเลขไทย 100%
-จัดกลุ่ม `[ส่วนหัว]` บนสุด, `[เนื้อหาหลัก]` ตรงกลาง, `[ส่วนท้าย]` ล่างสุด พร้อมกรองข้อความเบิ้ลซ้ำ
+รองรับ **.docx** รักษารูปแบบตัวเลขและอักขระไทย **100%**
+✅ จำลองการตัดหน้ากระดาษ (Page Break)
+✅ แยกแสดง `[ส่วนหัว หน้าที่ 1]`, `[ส่วนหัว หน้าที่ 2]` ... พร้อมรันเลขหน้าให้อัตโนมัติ
+✅ รวบ `[ส่วนท้าย]` ทั้งหมดไปแสดงไว้ล่างสุดเพียงชุดเดียวเพื่อไม่ให้รก
 """)
 
 st.divider()
@@ -233,22 +297,19 @@ st.divider()
 uploaded_file = st.file_uploader("📂 อัปโหลดไฟล์ Word (.docx)", type=["docx"])
 
 if uploaded_file is not None:
-    with st.spinner("กำลังวิเคราะห์โครงสร้างไฟล์และดึงข้อความ..."):
+    with st.spinner("กำลังวิเคราะห์โครงสร้าง ตัดหน้ากระดาษ และคำนวณเลขหน้า..."):
         try:
-            # ดึงข้อความ
             extracted_text = process_docx(uploaded_file)
             
             if extracted_text:
-                st.success("✅ ดึงข้อความสำเร็จ!")
+                st.success("✅ สกัดข้อความสำเร็จและแบ่งหน้าเรียบร้อยแล้ว!")
                 
-                # แสดงกล่องข้อความ
-                st.text_area("ข้อความที่สกัดได้ (สามารถแก้ไข หรือกดคัดลอกได้เลย)", value=extracted_text, height=500)
+                st.text_area("ข้อความที่สกัดได้ (คัดลอกไปเทียบ Text Diff ได้เลย)", value=extracted_text, height=600)
                 
-                # ปุ่มดาวน์โหลด
                 st.download_button(
                     label="💾 ดาวน์โหลดเป็นไฟล์ .txt",
                     data=extracted_text,
-                    file_name="extracted_formatted_text.txt",
+                    file_name="extracted_formatted_pages.txt",
                     mime="text/plain"
                 )
             else:
